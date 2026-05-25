@@ -16,6 +16,7 @@ use which::which;
 pub mod filesystem;
 pub mod luks2;
 pub mod zfs;
+pub mod ecryptfs;
 
 /// Run a command and return the stdout and stderr.
 pub fn run_command(
