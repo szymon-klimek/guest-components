@@ -30,7 +30,7 @@ pub struct Hub {
     image_client: OnceCell<Mutex<ImageClient>>,
     #[cfg(feature = "ttrpc")]
     aa_client: OnceCell<Option<AttestationAgentServiceClient>>,
-    config: CdhConfig,
+    pub(crate) config: CdhConfig,
 }
 
 impl Hub {
@@ -51,6 +51,10 @@ impl Hub {
         };
 
         hub.init().await?;
+        if let Some(storage) = hub.config.storage.take() {
+            hub.secure_mount(storage).await?;
+        }
+
         Ok(hub)
     }
 }

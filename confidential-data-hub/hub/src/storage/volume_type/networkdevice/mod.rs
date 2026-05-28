@@ -18,6 +18,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 use tracing::info;
+
 use crate::storage::drivers::run_command;
 
 const MOUNT_COMMAND: &str = "mount";
@@ -34,8 +35,10 @@ pub enum NetworkDeviceEncryptType {
 pub struct NetworkDeviceParameters {
     ip_addr: IpAddr,
     source_path: String,
-    #[serde(default)]
-    mount_options: String,
+    mount_options: Option<String>,
+    transit_mount_point: Option<String>,
+    #[serde(flatten)]
+    encryption_type: Option<NetworkDeviceEncryptType>,
 }
 
 #[derive(Default)]
@@ -55,42 +58,62 @@ impl NetworkDevice {
         _flags: &[String],
         mount_point: &str,
     ) -> Result<()> {
-        // construct BlockDeviceParameters
+        // construct NetworkDeviceParameters
         let parameters = serde_json::to_string(options)?;
         let parameters: NetworkDeviceParameters = serde_json::from_str(&parameters)?;
 
         // 1. get the network source path
         let source_path = format!("{}:{}", parameters.ip_addr, parameters.source_path);
 
-        // 2. # Create directory if it does not exist
-        if !Path::new(&source_path).exists() {
-            tokio::fs::create_dir_all(&source_path).await?;
-            self.temp_paths.push(source_path.to_string());
+        // 2. create transit mount point name if not given
+        let transit_mount_point: String =
+            parameters.transit_mount_point.unwrap_or(
+                format!("{}_transit", mount_point).to_string());
+
+        // 3. create directory for mount if it does not exist
+        if !Path::new(&transit_mount_point).exists() {
+            tokio::fs::create_dir_all(&transit_mount_point).await?;
+            self.temp_paths.push(transit_mount_point.to_string());
         }
 
-        // 3. do the workflow according to the source type and target type according to different encryption types
-        info!(
-            "mounting NFS from source point: {} to mount point: {}",
-            &source_path, mount_point
-        );
-
-        // setup mount NFS parameters
+        // 4. setup mount NFS parameters
         let mut args = vec!["-t", "nfs"];
 
-        if !parameters.mount_options.is_empty() {
-            args.extend(["-o", parameters.mount_options.as_str()]);
+        if let Some(mount_options) = &parameters.mount_options {
+            args.extend(["-o", mount_options.as_str()]);
         }
 
-        args.extend([source_path.as_str(), mount_point]);
+        args.extend([source_path.as_str(), transit_mount_point.as_str()]);
 
+        // 5. mount not encrypted NFS as a transit step before encryption
+        info!(
+            "mounting NFS from source point: {} to mount point: {}",
+            &source_path, transit_mount_point
+        );
+
+        // nix approach would need implementation of version+port negotiation first
         run_command(MOUNT_COMMAND, &args, None)
             .map_err(|source| NetworkDeviceError::MountError {
                 ip_addr: source_path.clone(),
-                mount_point: mount_point.parse().unwrap(),
+                mount_point: transit_mount_point.parse().unwrap(),
                 source,
             })?;
 
-        info!("Target path {} mounted successfully", mount_point);
+        info!("Target path {} mounted successfully", transit_mount_point);
+
+        // 6. do the workflow according to different encryption types
+        match parameters.encryption_type {
+            Some(NetworkDeviceEncryptType::Ecryptfs(ecryptfs_parameters)) => {
+                ecryptfs_parameters
+                    .do_mount(&transit_mount_point[..], mount_point)
+                    .await
+                    .map_err(|source| NetworkDeviceError::EcryptfsError { source })?;
+            },
+            None => {
+
+            }
+        }
+
         Ok(())
     }
 
@@ -111,7 +134,6 @@ impl NetworkDevice {
         }
         Ok(())
     }
-
 }
 
 

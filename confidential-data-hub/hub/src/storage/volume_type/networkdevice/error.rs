@@ -10,6 +10,12 @@ pub type Result<T> = std::result::Result<T, NetworkDeviceError>;
 #[derive(Error, Debug)]
 pub enum NetworkDeviceError {
 
+    #[error("Ecryptfs error: {source}")]
+    EcryptfsError{
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("I/O error: {0}")]
     IOError(#[from] std::io::Error),
 
