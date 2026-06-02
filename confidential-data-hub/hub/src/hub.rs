@@ -52,7 +52,18 @@ impl Hub {
 
         hub.init().await?;
         if let Some(storage) = hub.config.storage.take() {
-            hub.secure_mount(storage).await?;
+            // Spawn mount as a background task - don't block pod startup.
+            // Mount will wait for network and retry in background while pod starts.
+            tokio::spawn(async move {
+                match storage.mount().await {
+                    Ok(mount_point) => {
+                        tracing::info!("Background secure mount succeeded: {mount_point}");
+                    }
+                    Err(e) => {
+                        tracing::error!("Background secure mount failed: {e}");
+                    }
+                }
+            });
         }
 
         Ok(hub)

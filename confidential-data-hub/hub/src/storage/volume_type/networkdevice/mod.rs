@@ -5,6 +5,13 @@
 //
 
 //! # NetworkDevice SecureStorage
+//!
+//! This module implements NFS mounting using the nix crate's mount syscall directly.
+//! 
+//! **Important**: Only NFSv4 is supported. NFSv4 uses the well-known port 2049 and
+//! doesn't require portmapper/rpcbind negotiation, making it compatible with direct
+//! syscall-based mounting. NFSv3 requires mount helpers for port/version negotiation
+//! and is not supported.
 
 pub mod error;
 
@@ -12,6 +19,7 @@ use super::SecureMount;
 
 use async_trait::async_trait;
 use error::{NetworkDeviceError, Result};
+use nix::mount::{mount, MsFlags};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
@@ -19,9 +27,102 @@ use serde::{Deserialize, Serialize};
 use strum::Display;
 use tracing::info;
 
-use crate::storage::drivers::run_command;
+/// NFSv4 filesystem type. We use "nfs4" to explicitly require NFSv4 protocol,
+/// which uses the well-known port 2049 and doesn't need portmapper negotiation.
+const NFS4_FSTYPE: &str = "nfs4";
 
-const MOUNT_COMMAND: &str = "mount";
+/// Build mount options string for NFSv4 kernel client.
+///
+/// When using the mount syscall directly (bypassing the mount.nfs helper),
+/// the kernel NFS client requires certain options to be explicitly set:
+/// - `vers=4.2`: NFS protocol version (required for syscall-based mount)
+/// - `addr=<ip>`: Server IP address (required)
+///
+/// User-provided options are appended after required options.
+fn build_nfs4_mount_options(server_addr: &IpAddr, user_options: Option<&str>) -> String {
+    let mut options = vec![
+        "vers=4.2".to_string(),
+        format!("addr={}", server_addr),
+    ];
+
+    // Append user-provided options if any
+    if let Some(user_opts) = user_options {
+        if !user_opts.is_empty() {
+            options.push(user_opts.to_string());
+        }
+    }
+
+    options.join(",")
+}
+
+/// Check if a path is already mounted by reading /proc/mounts
+async fn is_mounted(mount_point: &str) -> Result<bool> {
+    let mounts = tokio::fs::read_to_string("/proc/mounts").await?;
+    let canonical_path = std::fs::canonicalize(mount_point)
+        .unwrap_or_else(|_| std::path::PathBuf::from(mount_point));
+    
+    Ok(mounts.lines().any(|line| {
+        // /proc/mounts format: device mount_point fstype options ...
+        line.split_whitespace()
+            .nth(1)
+            .map(|mp| mp == canonical_path.to_string_lossy())
+            .unwrap_or(false)
+    }))
+}
+
+/// Wait for the system network to be ready.
+/// Checks that a non-loopback network interface is up with routes configured.
+async fn wait_for_system_network_ready() -> Result<()> {
+    use std::time::Duration;
+    
+    const MAX_RETRIES: u32 = 60;
+    const RETRY_DELAY_MS: u64 = 1000;
+    
+    for attempt in 1..=MAX_RETRIES {
+        // Check /sys/class/net for interfaces and their operstate
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let iface = entry.file_name();
+                let iface_str = iface.to_string_lossy();
+                
+                // Skip loopback
+                if iface_str == "lo" {
+                    continue;
+                }
+                
+                // Check operstate is "up"
+                let operstate_path = format!("/sys/class/net/{}/operstate", iface_str);
+                if let Ok(state) = std::fs::read_to_string(&operstate_path) {
+                    if state.trim() == "up" {
+                        // Check if interface has routes in /proc/net/route
+                        if let Ok(route) = std::fs::read_to_string("/proc/net/route") {
+                            if route.lines().any(|line| line.starts_with(&*iface_str)) {
+                                info!(
+                                    "System network ready: interface {} is up with routes (attempt {})",
+                                    iface_str, attempt
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if attempt < MAX_RETRIES {
+            info!(
+                "Waiting for system network: attempt {}/{}, no ready interface yet...",
+                attempt, MAX_RETRIES
+            );
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+    }
+    
+    Err(NetworkDeviceError::NetworkUnreachable {
+        addr: "system network".to_string(),
+        attempts: MAX_RETRIES,
+    })
+}
 
 #[derive(Serialize, Deserialize, Display, Debug, PartialEq, Eq)]
 #[serde(tag = "encryptionType")]
@@ -62,8 +163,8 @@ impl NetworkDevice {
         let parameters = serde_json::to_string(options)?;
         let parameters: NetworkDeviceParameters = serde_json::from_str(&parameters)?;
 
-        // 1. get the network source path
-        let source_path = format!("{}:{}", parameters.ip_addr, parameters.source_path);
+        // 1. For display/logging purposes, format as server:path
+        let display_source = format!("{}:{}", parameters.ip_addr, parameters.source_path);
 
         // 2. create transit mount point name if not given
         let transit_mount_point: String =
@@ -76,30 +177,49 @@ impl NetworkDevice {
             self.temp_paths.push(transit_mount_point.to_string());
         }
 
-        // 4. setup mount NFS parameters
-        let mut args = vec!["-t", "nfs"];
+        // 4. mount NFSv4 as a transit step before encryption
+        // NFSv4 is required because it uses well-known port 2049 and doesn't need
+        // portmapper/rpcbind negotiation that the mount helper would normally perform.
+        
+        // Check if already mounted (can happen if called multiple times)
+        if is_mounted(&transit_mount_point).await? {
+            info!(
+                "Mount point {} is already mounted, skipping NFS mount",
+                transit_mount_point
+            );
+        } else {
+            // Wait for system network to be ready before attempting mount.
+            // This handles the case where CDH starts via init_data before
+            // the guest network is fully configured.
+            wait_for_system_network_ready().await?;
 
-        if let Some(mount_options) = &parameters.mount_options {
-            args.extend(["-o", mount_options.as_str()]);
-        }
+            info!(
+                "mounting NFSv4 from source point: {} to mount point: {}",
+                &display_source, transit_mount_point
+            );
 
-        args.extend([source_path.as_str(), transit_mount_point.as_str()]);
+            // Build mount options for kernel NFS client.
+            // Source format is "server:/path" and options must include vers=4.2 and addr=<ip>
+            let mount_options = build_nfs4_mount_options(
+                &parameters.ip_addr,
+                parameters.mount_options.as_deref(),
+            );
 
-        // 5. mount not encrypted NFS as a transit step before encryption
-        info!(
-            "mounting NFS from source point: {} to mount point: {}",
-            &source_path, transit_mount_point
-        );
-
-        // nix approach would need implementation of version+port negotiation first
-        run_command(MOUNT_COMMAND, &args, None)
+            mount::<str, str, str, str>(
+                Some(&display_source),
+                &transit_mount_point,
+                Some(NFS4_FSTYPE),
+                MsFlags::empty(),
+                Some(&mount_options),
+            )
             .map_err(|source| NetworkDeviceError::MountError {
-                ip_addr: source_path.clone(),
-                mount_point: transit_mount_point.parse().unwrap(),
+                ip_addr: display_source.clone(),
+                mount_point: transit_mount_point.clone(),
                 source,
             })?;
 
-        info!("Target path {} mounted successfully", transit_mount_point);
+            info!("Target path {} mounted successfully", transit_mount_point);
+        }
 
         // 6. do the workflow according to different encryption types
         match parameters.encryption_type {

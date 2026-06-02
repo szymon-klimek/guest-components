@@ -22,12 +22,12 @@ pub enum NetworkDeviceError {
     #[error("Failed to serialize or deserialize JSON: {0}")]
     SerdeError(#[from] serde_json::Error),
 
-    #[error("Failed to mount NFS from IP address {ip_addr} to mount point {mount_point}: {source}")]
+    #[error("Failed to mount NFSv4 from {ip_addr} to mount point {mount_point}: {source}")]
     MountError {
         ip_addr: String,
         mount_point: String,
         #[source]
-        source: anyhow::Error,
+        source: nix::Error,
     },
 
     #[error("Failed to umount device {mount_point}: {source}")]
@@ -35,5 +35,11 @@ pub enum NetworkDeviceError {
         mount_point: String,
         #[source]
         source: nix::Error,
+    },
+
+    #[error("Network unreachable to {addr} after {attempts} attempts")]
+    NetworkUnreachable {
+        addr: String,
+        attempts: u32,
     },
 }
