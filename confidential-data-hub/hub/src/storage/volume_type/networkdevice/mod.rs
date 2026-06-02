@@ -31,28 +31,58 @@ use tracing::info;
 /// which uses the well-known port 2049 and doesn't need portmapper negotiation.
 const NFS4_FSTYPE: &str = "nfs4";
 
-/// Build mount options string for NFSv4 kernel client.
-///
-/// When using the mount syscall directly (bypassing the mount.nfs helper),
-/// the kernel NFS client requires certain options to be explicitly set:
-/// - `vers=4.2`: NFS protocol version (required for syscall-based mount)
-/// - `addr=<ip>`: Server IP address (required)
-///
-/// User-provided options are appended after required options.
-fn build_nfs4_mount_options(server_addr: &IpAddr, user_options: Option<&str>) -> String {
-    let mut options = vec![
-        "vers=4.2".to_string(),
-        format!("addr={}", server_addr),
-    ];
+/// Parse mount options string into a HashMap.
+/// Format: "key1=value1,key2=value2,flag"
+/// Splits on comma, then on equals for key=value pairs.
+fn parse_mount_options(options_str: &str) -> HashMap<String, String> {
+    options_str
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|opt| {
+            if let Some((key, value)) = opt.split_once('=') {
+                (key.trim().to_string(), value.trim().to_string())
+            } else {
+                // Flag-style option without value
+                (opt.trim().to_string(), String::new())
+            }
+        })
+        .collect()
+}
 
-    // Append user-provided options if any
-    if let Some(user_opts) = user_options {
-        if !user_opts.is_empty() {
-            options.push(user_opts.to_string());
-        }
+/// Convert HashMap of mount options back to a comma-separated string.
+fn mount_options_to_string(options: &HashMap<String, String>) -> String {
+    options
+        .iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                k.clone()
+            } else {
+                format!("{}={}", k, v)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Ensure required NFS4 mount options are present.
+/// Adds `vers=4.2` if not present, adds `addr=<ip>` if not present.
+/// Returns the options as a comma-separated string ready for mount syscall.
+fn ensure_nfs4_mount_options(server_addr: &IpAddr, user_options: Option<&str>) -> String {
+    let mut options = user_options
+        .map(parse_mount_options)
+        .unwrap_or_default();
+    
+    // Add vers=4.2 if not present
+    if !options.contains_key("vers") {
+        options.insert("vers".to_string(), "4.2".to_string());
     }
-
-    options.join(",")
+    
+    // Add addr=<ip> if not present
+    if !options.contains_key("addr") {
+        options.insert("addr".to_string(), server_addr.to_string());
+    }
+    
+    mount_options_to_string(&options)
 }
 
 /// Check if a path is already mounted by reading /proc/mounts
@@ -199,8 +229,8 @@ impl NetworkDevice {
             );
 
             // Build mount options for kernel NFS client.
-            // Source format is "server:/path" and options must include vers=4.2 and addr=<ip>
-            let mount_options = build_nfs4_mount_options(
+            // Ensures vers=4.2 and addr=<ip> are present.
+            let mount_options = ensure_nfs4_mount_options(
                 &parameters.ip_addr,
                 parameters.mount_options.as_deref(),
             );
