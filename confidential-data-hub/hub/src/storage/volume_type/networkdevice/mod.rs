@@ -29,7 +29,8 @@ use tracing::info;
 
 /// NFSv4 filesystem type. We use "nfs4" to explicitly require NFSv4 protocol,
 /// which uses the well-known port 2049 and doesn't need portmapper negotiation.
-const NFS4_FSTYPE: &str = "nfs4";
+const NFS4_FS_NAME: &str = "nfs4";
+const DEFAULT_NFS_VERSION: &str = "4.2";
 
 /// Parse mount options string into a HashMap.
 /// Format: "key1=value1,key2=value2,flag"
@@ -74,7 +75,7 @@ fn ensure_nfs4_mount_options(server_addr: &IpAddr, user_options: Option<&str>) -
     
     // Add vers=4.2 if not present
     if !options.contains_key("vers") {
-        options.insert("vers".to_string(), "4.2".to_string());
+        options.insert("vers".to_string(), DEFAULT_NFS_VERSION.to_string());
     }
     
     // Add addr=<ip> if not present
@@ -238,7 +239,7 @@ impl NetworkDevice {
             mount::<str, str, str, str>(
                 Some(&display_source),
                 &transit_mount_point,
-                Some(NFS4_FSTYPE),
+                Some(NFS4_FS_NAME),
                 MsFlags::empty(),
                 Some(&mount_options),
             )

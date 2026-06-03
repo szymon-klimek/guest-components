@@ -8,22 +8,37 @@ use kms::{Annotations, ProviderSettings};
 use crate::secret;
 use crate::storage::volume_type::blockdevice::error::BlockDeviceError;
 
-const ECRYPTFS: &str = "ecryptfs";
-const DEFAULT_CIPHER: &str = "aes";
-const DEFAULT_KEY_BYTES: &str = "32";
-const DEFAULT_ENABLE_PASSTHROUGH: &str = "false";
-const DEFAULT_ENABLE_FILENAME_CRYPTO: &str = "true";
+const ECRYPTFS_FS_NAME: &str = "ecryptfs";
 
+mod defaults {
+    pub const CIPHER: &str = "aes";
+    pub const KEY_BYTES: &str = "32";
+    pub const ENABLE_PASSTHROUGH: &str = "false";
+    pub const ENABLE_FILENAME_CRYPTO: &str = "false";
+    pub const UNLINK_SIGS: &str = "true";
+
+    pub fn cipher() -> String { CIPHER.into() }
+    pub fn key_bytes() -> String { KEY_BYTES.into() }
+    pub fn enable_passthrough() -> String { ENABLE_PASSTHROUGH.into() }
+    pub fn enable_filename_crypto() -> String { ENABLE_FILENAME_CRYPTO.into() }
+    pub fn unlink_sigs() -> String { UNLINK_SIGS.into() }
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct EcryptfsMountParameters {
-    sig: String,
-    fnek_sig: String,
-    passphrase: String,
-    cipher: Option<String>,
-    key_bytes: Option<String>,
-    enable_passthrough: Option<String>,
-    enable_filename_crypto: Option<String>
+    passphrase: Option<String>,
+    sig: Option<String>,
+    fnek_sig: Option<String>,
+    #[serde(default = "defaults::cipher")]
+    cipher: String,
+    #[serde(default = "defaults::key_bytes")]
+    key_bytes: String,
+    #[serde(default = "defaults::enable_passthrough")]
+    enable_passthrough: String,
+    #[serde(default = "defaults::enable_filename_crypto")]
+    enable_filename_crypto: String,
+    #[serde(default = "defaults::unlink_sigs")]
+    unlink_sigs: String,
 }
 
 impl EcryptfsMountParameters {
@@ -34,6 +49,7 @@ impl EcryptfsMountParameters {
         source_path: &str,
         mount_point: &str,
     ) -> anyhow::Result<Option<String>> {
+        self.validate()?;
 
         let parameters = self.build_parameters().await;
 
@@ -48,10 +64,14 @@ impl EcryptfsMountParameters {
             "mounting ecryptfs to mount point: {}",
             mount_point
         );
+        debug!(
+            "ecryptfs options: {}",
+            parameters
+        );
         mount::<_, _, str, _>(
             Some(source_path),
             mount_point,
-            Some(ECRYPTFS),
+            Some(ECRYPTFS_FS_NAME),
             MsFlags::MS_NOATIME,
             Some(&parameters[..]),
         )
@@ -67,63 +87,70 @@ impl EcryptfsMountParameters {
     async fn build_parameters(&self) -> String {
         let mut args = vec![];
 
-        let cipher: String = self.cipher.clone().unwrap_or(DEFAULT_CIPHER.parse().unwrap());
-        args.push(format!("ecryptfs_cipher={}", cipher));
-
-        let key_bytes: String = self.key_bytes.clone().unwrap_or(DEFAULT_KEY_BYTES.parse().unwrap());
-        args.push(format!("ecryptfs_key_bytes={}", key_bytes));
-
-        let enable_passthrough: String =
-            self.enable_passthrough.clone()
-                .unwrap_or(DEFAULT_ENABLE_PASSTHROUGH.parse().unwrap());
-        args.push(format!("ecryptfs_passthrough={}",
-                          parse_string_boolean_value_to_mount_supported(enable_passthrough)));
-
-        let enable_filename_crypto: String =
-            self.enable_filename_crypto.clone()
-                .unwrap_or(DEFAULT_ENABLE_FILENAME_CRYPTO.parse().unwrap());
-        args.push(format!("ecryptfs_enable_filename_crypto={}",
-                          parse_string_boolean_value_to_mount_supported(enable_filename_crypto)));
-
-        let sig = get_plaintext_key(&self.sig[..]);
-        match sig.await {
-            Ok(vec) =>  {
-                args.push(
-                    format!("ecryptfs_sig={}", String::from_utf8(vec.to_vec()).unwrap()));
-            },
-            Err(e) => info!("Error while getting SIG: {}", e),
+        args.push(format!("ecryptfs_cipher={}", self.cipher));
+        args.push(format!("ecryptfs_key_bytes={}", self.key_bytes));
+        if parse_string_boolean_to_bool(&self.enable_passthrough) {
+            args.push("ecryptfs_passthrough".to_string());
+        }
+        if parse_string_boolean_to_bool(&self.enable_filename_crypto) {
+            args.push("ecryptfs_enable_filename_crypto".to_string());
+        }
+        if parse_string_boolean_to_bool(&self.unlink_sigs) {
+            args.push("ecryptfs_unlink_sigs".to_string());
         }
 
-        let fnek_sig = get_plaintext_key(&self.fnek_sig[..]);
-        match fnek_sig.await {
-            Ok(vec) =>  {
-                args.push(
-                    format!("ecryptfs_fnek_sig={}", String::from_utf8(vec.to_vec()).unwrap()));
-            },
-            Err(e) => error!("Error while getting FNEK_SIG: {}", e),
+        if let Some(ref sig) = self.sig {
+            match get_plaintext_key(sig).await {
+                Ok(vec) => {
+                    args.push(format!(
+                        "ecryptfs_sig={}",
+                        String::from_utf8(vec.to_vec()).unwrap().trim()
+                    ));
+                }
+                Err(e) => info!("Error while getting SIG: {}", e),
+            }
         }
 
-        let passphrase = get_plaintext_key(&self.passphrase[..]);
-        match passphrase.await {
-            Ok(vec) =>  {
-                args.push(
-                    format!("key=passphrase:passphrase_passwd={}", String::from_utf8(vec.to_vec()).unwrap()));
-            },
-            Err(e) => error!("Error while getting passphrase: {}", e),
+        if let Some(ref fnek_sig) = self.fnek_sig {
+            match get_plaintext_key(fnek_sig).await {
+                Ok(vec) => {
+                    args.push(format!(
+                        "ecryptfs_fnek_sig={}",
+                        String::from_utf8(vec.to_vec()).unwrap().trim()
+                    ));
+                }
+                Err(e) => error!("Error while getting FNEK_SIG: {}", e),
+            }
         }
+
+        // Note: passphrase is used to add key to kernel keyring (via add_key_to_keyring),
+        // not passed directly to mount. The kernel only accepts ecryptfs_sig.
 
         args.join(",").to_string()
     }
+
+    /// Validate parameters before mounting.
+    /// Returns an error if:
+    /// - neither passphrase nor sig is provided
+    /// - enable_filename_crypto is true but fnek_sig is not provided
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.passphrase.is_none() && self.sig.is_none() {
+            anyhow::bail!("at least one of passphrase or sig must be provided");
+        }
+
+        let filename_crypto_enabled = parse_string_boolean_to_bool(&self.enable_filename_crypto);
+        if filename_crypto_enabled && self.fnek_sig.is_none() {
+            anyhow::bail!("fnek_sig is required when enable_filename_crypto is true");
+        }
+        Ok(())
+    }
 }
 
-fn parse_string_boolean_value_to_mount_supported(string_boolean_value: String) -> String {
-    let value_true = "y".parse().unwrap();
-    let value_false = "n".parse().unwrap();
-    match string_boolean_value.to_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" | "on" => value_true,
-        "false" | "0" | "no" | "n" | "off" => value_false,
-        _ => value_false,
-    }
+fn parse_string_boolean_to_bool(value: &str) -> bool {
+    matches!(
+        value.to_lowercase().as_str(),
+        "true" | "1" | "yes" | "y" | "on"
+    )
 }
 
 async fn get_plaintext_key(key_uri: &str) -> crate::storage::volume_type::blockdevice::error::Result<Zeroizing<Vec<u8>>> {
