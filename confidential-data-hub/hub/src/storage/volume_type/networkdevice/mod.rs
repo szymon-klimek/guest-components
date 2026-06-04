@@ -26,6 +26,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 use tracing::info;
+use uuid::Uuid;
 
 /// NFSv4 filesystem type. We use "nfs4" to explicitly require NFSv4 protocol,
 /// which uses the well-known port 2049 and doesn't need portmapper negotiation.
@@ -199,8 +200,9 @@ impl NetworkDevice {
 
         // 2. create transit mount point name if not given
         let transit_mount_point: String =
-            parameters.transit_mount_point.unwrap_or(
-                format!("{}_transit", mount_point).to_string());
+            parameters.transit_mount_point.unwrap_or_else(|| {
+                format!("/tmp/{}/nfs", Uuid::new_v4())
+            });
 
         // 3. create directory for mount if it does not exist
         if !Path::new(&transit_mount_point).exists() {
