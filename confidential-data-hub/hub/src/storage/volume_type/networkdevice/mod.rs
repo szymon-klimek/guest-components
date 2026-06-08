@@ -164,20 +164,117 @@ pub enum NetworkDeviceEncryptType {
     Ecryptfs(crate::storage::drivers::ecryptfs::EcryptfsMountParameters),
 }
 
-/// Config file path for pre-installed guest hooks
-/// Hooks are pre-installed in guest image and read config from this file
-const HOOK_CONFIG_FILE: &str = "/run/cdh-ecryptfs.conf";
+/// Kata guest hooks directory (writable location since rootfs is read-only)
+const GUEST_HOOKS_DIR: &str = "/run/cdh-hooks";
 
-/// Write configuration for pre-installed Kata guest hooks.
-/// Hooks are pre-installed in guest image at guest_hook_path/{prestart,poststop}/cdh-ecryptfs
-/// and read SOURCE_MOUNT and CONTAINER_PATH from this config file.
+/// Config file path for guest hooks (inside GUEST_HOOKS_DIR)
+const HOOK_CONFIG_FILE: &str = "/run/cdh-hooks/conf";
+
+/// Create Kata guest hooks dynamically.
+/// Hooks wait for config file to appear (handles timing with NFS/ecryptfs mount).
+async fn create_guest_hooks() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    
+    let prestart_dir = format!("{}/prestart", GUEST_HOOKS_DIR);
+    let poststop_dir = format!("{}/poststop", GUEST_HOOKS_DIR);
+    
+    tokio::fs::create_dir_all(&prestart_dir).await?;
+    tokio::fs::create_dir_all(&poststop_dir).await?;
+    
+    // Prestart hook - waits for config, then mounts ecryptfs into container
+    let prestart_script = r#"#!/bin/sh
+# CDH ecryptfs prestart hook - mounts encrypted storage into container
+CONFIG_FILE="/run/cdh-hooks/conf"
+
+# Wait for config file (CDH may still be mounting NFS/ecryptfs)
+WAIT_COUNT=0
+while [ ! -f "$CONFIG_FILE" ] && [ $WAIT_COUNT -lt 60 ]; do
+    sleep 0.5
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+[ ! -f "$CONFIG_FILE" ] && exit 0
+
+. "$CONFIG_FILE"
+[ -z "$SOURCE_MOUNT" ] || [ -z "$CONTAINER_PATH" ] && exit 0
+
+STATE=$(cat)
+CONTAINER_ID=$(echo "$STATE" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+
+if [ -z "$CONTAINER_ID" ]; then
+    BUNDLE=$(echo "$STATE" | grep -o '"bundle"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -n "$BUNDLE" ] && CONTAINER_ID=$(basename "$BUNDLE")
+fi
+
+[ -z "$CONTAINER_ID" ] && exit 0
+
+KATA_DIR="/run/kata-containers"
+ROOTFS="$KATA_DIR/$CONTAINER_ID/rootfs"
+TARGET="$ROOTFS$CONTAINER_PATH"
+
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -d "$ROOTFS" ] && break
+    sleep 0.1
+done
+
+[ ! -d "$ROOTFS" ] && exit 0
+
+mkdir -p "$TARGET" 2>/dev/null
+mountpoint -q "$TARGET" 2>/dev/null && exit 0
+
+mount --bind "$SOURCE_MOUNT" "$TARGET" && mount --make-private "$TARGET"
+echo "CDH prestart: Mounted $SOURCE_MOUNT to $TARGET" >&2
+"#;
+
+    // Poststop hook - unmounts to protect data
+    let poststop_script = r#"#!/bin/sh
+# CDH ecryptfs poststop hook - unmounts to protect data from cleanup
+CONFIG_FILE="/run/cdh-hooks/conf"
+
+[ ! -f "$CONFIG_FILE" ] && exit 0
+
+. "$CONFIG_FILE"
+[ -z "$CONTAINER_PATH" ] && exit 0
+
+STATE=$(cat)
+CONTAINER_ID=$(echo "$STATE" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+
+if [ -z "$CONTAINER_ID" ]; then
+    BUNDLE=$(echo "$STATE" | grep -o '"bundle"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -n "$BUNDLE" ] && CONTAINER_ID=$(basename "$BUNDLE")
+fi
+
+[ -z "$CONTAINER_ID" ] && exit 0
+
+TARGET="/run/kata-containers/$CONTAINER_ID/rootfs$CONTAINER_PATH"
+
+sync
+if mountpoint -q "$TARGET" 2>/dev/null; then
+    umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null
+    echo "CDH poststop: Unmounted $TARGET" >&2
+fi
+"#;
+
+    let prestart_path = format!("{}/cdh-ecryptfs", prestart_dir);
+    let poststop_path = format!("{}/cdh-ecryptfs", poststop_dir);
+    
+    tokio::fs::write(&prestart_path, prestart_script).await?;
+    tokio::fs::set_permissions(&prestart_path, std::fs::Permissions::from_mode(0o755)).await?;
+    
+    tokio::fs::write(&poststop_path, poststop_script).await?;
+    tokio::fs::set_permissions(&poststop_path, std::fs::Permissions::from_mode(0o755)).await?;
+    
+    info!("Created guest hooks at {}", GUEST_HOOKS_DIR);
+    Ok(())
+}
+
+/// Write configuration for guest hooks.
 async fn write_hook_config(
     source_mount: &str,
     container_path: &str,
 ) -> std::io::Result<()> {
     let config = format!(
         "# CDH ecryptfs hook configuration\n\
-         # Written by CDH, read by pre-installed hooks\n\
          SOURCE_MOUNT=\"{}\"\n\
          CONTAINER_PATH=\"{}\"\n",
         source_mount,
@@ -223,6 +320,14 @@ impl NetworkDevice {
         // construct NetworkDeviceParameters
         let parameters = serde_json::to_string(options)?;
         let parameters: NetworkDeviceParameters = serde_json::from_str(&parameters)?;
+
+        // Create guest hooks early if ecryptfs is requested
+        // Hooks will wait for config file, which is written after ecryptfs mount
+        if parameters.encryption_type.is_some() {
+            if let Err(e) = create_guest_hooks().await {
+                error!("Failed to create guest hooks: {}", e);
+            }
+        }
 
         // 1. For display/logging purposes, format as server:path
         let display_source = format!("{}:{}", parameters.ip_addr, parameters.source_path);
@@ -304,8 +409,8 @@ impl NetworkDevice {
                     .await
                     .map_err(|source| NetworkDeviceError::EcryptfsError { source })?;
                 
-                // Write config for pre-installed Kata guest hooks
-                // Hooks are baked into guest image and read config from /run/cdh-ecryptfs.conf
+                // Write config for dynamically created Kata guest hooks
+                // Hooks read config from /run/cdh-hooks/conf
                 if let Err(e) = write_hook_config(&ecryptfs_mount_point, mount_point).await {
                     error!("Failed to write hook config: {}", e);
                 }
