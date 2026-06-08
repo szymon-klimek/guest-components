@@ -42,4 +42,9 @@ pub enum NetworkDeviceError {
         addr: String,
         attempts: u32,
     },
+
+    #[error("Failed to create container bind-mount hook: {message}")]
+    HookCreationError {
+        message: String,
+    },
 }

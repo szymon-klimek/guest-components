@@ -25,7 +25,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use strum::Display;
-use tracing::info;
+use tracing::{info, error};
 use uuid::Uuid;
 
 /// NFSv4 filesystem type. We use "nfs4" to explicitly require NFSv4 protocol,
@@ -164,6 +164,35 @@ pub enum NetworkDeviceEncryptType {
     Ecryptfs(crate::storage::drivers::ecryptfs::EcryptfsMountParameters),
 }
 
+/// Config file path for pre-installed guest hooks
+/// Hooks are pre-installed in guest image and read config from this file
+const HOOK_CONFIG_FILE: &str = "/run/cdh-ecryptfs.conf";
+
+/// Write configuration for pre-installed Kata guest hooks.
+/// Hooks are pre-installed in guest image at guest_hook_path/{prestart,poststop}/cdh-ecryptfs
+/// and read SOURCE_MOUNT and CONTAINER_PATH from this config file.
+async fn write_hook_config(
+    source_mount: &str,
+    container_path: &str,
+) -> std::io::Result<()> {
+    let config = format!(
+        "# CDH ecryptfs hook configuration\n\
+         # Written by CDH, read by pre-installed hooks\n\
+         SOURCE_MOUNT=\"{}\"\n\
+         CONTAINER_PATH=\"{}\"\n",
+        source_mount,
+        container_path,
+    );
+    
+    tokio::fs::write(HOOK_CONFIG_FILE, &config).await?;
+    
+    info!("Wrote hook config to {}", HOOK_CONFIG_FILE);
+    info!("  SOURCE_MOUNT={}", source_mount);
+    info!("  CONTAINER_PATH={}", container_path);
+    
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub struct NetworkDeviceParameters {
     ip_addr: IpAddr,
@@ -257,10 +286,29 @@ impl NetworkDevice {
         // 6. do the workflow according to different encryption types
         match parameters.encryption_type {
             Some(NetworkDeviceEncryptType::Ecryptfs(ecryptfs_parameters)) => {
+                // ecryptfs mounts to a sibling directory of the NFS transit mount
+                // e.g., /tmp/<uuid>/nfs -> /tmp/<uuid>/nfs_ecryptfs
+                let ecryptfs_mount_point = format!(
+                    "{}_ecryptfs",
+                    transit_mount_point.trim_end_matches('/')
+                );
+                
+                // Create the ecryptfs mount directory
+                if !Path::new(&ecryptfs_mount_point).exists() {
+                    tokio::fs::create_dir_all(&ecryptfs_mount_point).await?;
+                    self.temp_paths.push(ecryptfs_mount_point.clone());
+                }
+                
                 ecryptfs_parameters
-                    .do_mount(&transit_mount_point[..], mount_point)
+                    .do_mount(&transit_mount_point[..], &ecryptfs_mount_point)
                     .await
                     .map_err(|source| NetworkDeviceError::EcryptfsError { source })?;
+                
+                // Write config for pre-installed Kata guest hooks
+                // Hooks are baked into guest image and read config from /run/cdh-ecryptfs.conf
+                if let Err(e) = write_hook_config(&ecryptfs_mount_point, mount_point).await {
+                    error!("Failed to write hook config: {}", e);
+                }
             },
             None => {
 
