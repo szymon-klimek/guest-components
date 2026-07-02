@@ -11,7 +11,14 @@ use crate::secret;
 use crate::storage::volume_type::blockdevice::error::BlockDeviceError;
 
 const ECRYPTFS_FS_NAME: &str = "ecryptfs";
-const ECRYPTFS_DEFAULT_SALT: [u8; 8] = [0x00; 8];
+const ECRYPTFS_DEFAULT_SALT: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+// Compatibility note:
+// ecryptfs-add-passphrase --fnek passes ECRYPTFS_DEFAULT_SALT_FNEK_HEX
+// as a char* to generate_passphrase_sig(), which then consumes only the
+// first 8 bytes as raw salt. That makes the effective FNEK salt bytes
+// ASCII "99887766" (0x39,0x39,0x38,0x38,0x37,0x37,0x36,0x36), yielding
+// signatures like 39b3c3fa4d086d94 for "My secure password".
+const ECRYPTFS_DEFAULT_SALT_FNEK: [u8; 8] = *b"99887766";
 const ECRYPTFS_DEFAULT_NUM_HASH_ITERATIONS: u32 = 65536;
 // Keyring constants - try session keyring first, as that's what ecryptfs searches
 const KEY_SPEC_SESSION_KEYRING: i32 = -3;
@@ -108,23 +115,60 @@ impl EcryptfsMountParameters {
         }
 
         let filename_crypto_enabled = parse_string_boolean_to_bool(&self.enable_filename_crypto);
+        let fek_uri = self.passphrase.as_deref();
+        let fnek_uri = if filename_crypto_enabled {
+            self.fnek_passphrase.as_deref().or(self.passphrase.as_deref())
+        } else {
+            None
+        };
 
-        // Derive key from passphrase and add to kernel keyring
-        let computed_sig = if let Some(ref passphrase_uri) = self.passphrase {
+        let mut fek_passphrase: Option<Zeroizing<Vec<u8>>> = None;
+        if let Some(passphrase_uri) = fek_uri {
             match get_plaintext_key(passphrase_uri).await {
-                Ok(passphrase_bytes) => {
-                    let passphrase = String::from_utf8(passphrase_bytes.to_vec())
-                        .unwrap_or_default();
-                    match add_key_to_keyring(passphrase.trim().as_bytes(), key_bytes) {
-                        Ok(sig) => Some(sig),
-                        Err(e) => {
-                            error!("Failed to add key to keyring: {}", e);
-                            None
-                        }
+                Ok(raw_passphrase_bytes) => {
+                    let passphrase = normalize_passphrase_bytes(raw_passphrase_bytes.as_slice());
+                    let utf8_valid = std::str::from_utf8(passphrase.as_slice()).is_ok();
+                    debug!(
+                        "ecryptfs FEK: fetched passphrase raw_len={} normalized_len={} utf8_valid={} source_uri={}",
+                        raw_passphrase_bytes.len(),
+                        passphrase.len(),
+                        utf8_valid,
+                        passphrase_uri
+                    );
+                    if utf8_valid {
+                        debug!(
+                            "ecryptfs FEK passphrase plaintext: {}",
+                            String::from_utf8_lossy(passphrase.as_slice())
+                        );
+                    } else {
+                        debug!(
+                            "ecryptfs FEK passphrase plaintext: <non-utf8-bytes>"
+                        );
                     }
+                    fek_passphrase = Some(passphrase);
                 }
                 Err(e) => {
                     error!("Error getting passphrase: {}", e);
+                }
+            }
+        }
+
+        // Derive key from passphrase and add to kernel keyring
+        let computed_sig = if let Some(passphrase) = fek_passphrase.as_ref() {
+            debug!(
+                "ecryptfs FEK: deriving signature with salt={} key_bytes={} passphrase_len={}",
+                hex::encode(ECRYPTFS_DEFAULT_SALT),
+                key_bytes,
+                passphrase.len(),
+            );
+            match add_key_to_keyring(
+                passphrase.as_slice(),
+                key_bytes,
+                &ECRYPTFS_DEFAULT_SALT,
+            ) {
+                Ok(sig) => Some(sig),
+                Err(e) => {
+                    error!("Failed to add key to keyring: {}", e);
                     None
                 }
             }
@@ -134,26 +178,77 @@ impl EcryptfsMountParameters {
 
         // Derive fnek key from fnek_passphrase (or passphrase if not provided)
         let computed_fnek_sig = if filename_crypto_enabled {
-            // Use fnek_passphrase if provided, otherwise fall back to passphrase
-            let fnek_uri = self.fnek_passphrase.as_ref().or(self.passphrase.as_ref());
-            
             if let Some(uri) = fnek_uri {
-                match get_plaintext_key(uri).await {
-                    Ok(passphrase_bytes) => {
-                        let passphrase = String::from_utf8(passphrase_bytes.to_vec())
-                            .unwrap_or_default();
-                        match add_key_to_keyring(passphrase.trim().as_bytes(), key_bytes) {
-                            Ok(sig) => Some(sig),
-                            Err(e) => {
-                                error!("Failed to add fnek key to keyring: {}", e);
-                                None
-                            }
+                let reuse_fek_for_fnek = fek_uri == Some(uri);
+                let mut fnek_passphrase: Option<Zeroizing<Vec<u8>>> = None;
+
+                if reuse_fek_for_fnek {
+                    debug!(
+                        "ecryptfs FNEK: reusing FEK passphrase fetched from source_uri={} (no second KBS fetch)",
+                        uri
+                    );
+                } else {
+                    match get_plaintext_key(uri).await {
+                        Ok(raw_passphrase_bytes) => {
+                            let passphrase = normalize_passphrase_bytes(raw_passphrase_bytes.as_slice());
+                            let utf8_valid = std::str::from_utf8(passphrase.as_slice()).is_ok();
+                            debug!(
+                                "ecryptfs FNEK: fetched passphrase raw_len={} normalized_len={} utf8_valid={} source_uri={}",
+                                raw_passphrase_bytes.len(),
+                                passphrase.len(),
+                                utf8_valid,
+                                uri
+                            );
+                            debug!(
+                                "ecryptfs FNEK passphrase plaintext='{}' hex={} source_uri={}",
+                                String::from_utf8_lossy(passphrase.as_slice()),
+                                hex::encode(passphrase.as_slice()),
+                                uri
+                            );
+                            fnek_passphrase = Some(passphrase);
+                        }
+                        Err(e) => {
+                            error!("Error getting fnek passphrase: {}", e);
                         }
                     }
-                    Err(e) => {
-                        error!("Error getting fnek passphrase: {}", e);
-                        None
+                }
+
+                let passphrase = if reuse_fek_for_fnek {
+                    fek_passphrase.as_ref()
+                } else {
+                    fnek_passphrase.as_ref()
+                };
+
+                if let Some(passphrase) = passphrase {
+                    if reuse_fek_for_fnek {
+                        debug!(
+                            "ecryptfs FNEK passphrase plaintext='{}' hex={} source_uri={} (reused from FEK)",
+                            String::from_utf8_lossy(passphrase.as_slice()),
+                            hex::encode(passphrase.as_slice()),
+                            uri
+                        );
                     }
+                    debug!(
+                        "ecryptfs FNEK: deriving signature with salt={} key_bytes={} passphrase_len={} source_uri={} reused_from_fek={}",
+                        hex::encode(ECRYPTFS_DEFAULT_SALT_FNEK),
+                        key_bytes,
+                        passphrase.len(),
+                        uri,
+                        reuse_fek_for_fnek
+                    );
+                    match add_key_to_keyring(
+                        passphrase.as_slice(),
+                        key_bytes,
+                        &ECRYPTFS_DEFAULT_SALT_FNEK,
+                    ) {
+                        Ok(sig) => Some(sig),
+                        Err(e) => {
+                            error!("Failed to add fnek key to keyring: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
             } else {
                 None
@@ -164,13 +259,22 @@ impl EcryptfsMountParameters {
 
         // Add ecryptfs_sig
         if let Some(ref sig) = computed_sig {
+            debug!("ecryptfs FEK signature: {}", sig);
             args.push(format!("ecryptfs_sig={}", sig));
         }
 
         // Add ecryptfs_fnek_sig if filename crypto is enabled
         if let Some(ref fnek_sig) = computed_fnek_sig {
+            debug!("ecryptfs FNEK signature: {}", fnek_sig);
             args.push(format!("ecryptfs_fnek_sig={}", fnek_sig));
         }
+
+        debug!(
+            "ecryptfs mount signatures summary: sig={:?} fnek_sig={:?} filename_crypto_enabled={}",
+            computed_sig,
+            computed_fnek_sig,
+            filename_crypto_enabled
+        );
 
         args.join(",").to_string()
     }
@@ -222,6 +326,15 @@ async fn get_plaintext_key(key_uri: &str) -> crate::storage::volume_type::blockd
     Ok(Zeroizing::new(key))
 }
 
+fn normalize_passphrase_bytes(input: &[u8]) -> Zeroizing<Vec<u8>> {
+    // Keep secret bytes unchanged except common line endings from file-based secrets.
+    let mut output = input.to_vec();
+    while matches!(output.last(), Some(b'\n' | b'\r')) {
+        output.pop();
+    }
+    Zeroizing::new(output)
+}
+
 // eCryptfs auth_tok constants
 const ECRYPTFS_VERSION: u16 = 0x0004;
 const ECRYPTFS_PASSWORD: u16 = 0x0000;
@@ -230,6 +343,7 @@ const ECRYPTFS_MAX_KEY_BYTES: usize = 64;
 const ECRYPTFS_SALT_SIZE: usize = 8;
 const ECRYPTFS_PASSWORD_SIG_SIZE: usize = 17; // 16 hex chars + null terminator
 const ECRYPTFS_SESSION_KEY_ENCRYPTION_KEY_SET: u32 = 0x02;
+const PGP_DIGEST_ALGO_SHA512: i32 = 10;
 // session_key struct size: flags(4) + encrypted_key_size(4) + decrypted_key_size(4) + encrypted_key(512) + decrypted_key(64) = 588
 const ECRYPTFS_SESSION_KEY_SIZE: usize = 4 + 4 + 4 + ECRYPTFS_MAX_ENCRYPTED_KEY_BYTES + ECRYPTFS_MAX_KEY_BYTES;
 
@@ -273,9 +387,9 @@ impl EcryptfsAuthTok {
             reserved: [0u8; 32],
             password: EcryptfsPassword {
                 password_bytes: 0,
-                hash_algo: 0,
+                hash_algo: PGP_DIGEST_ALGO_SHA512,
                 hash_iterations: ECRYPTFS_DEFAULT_NUM_HASH_ITERATIONS as i32,
-                session_key_encryption_key_bytes: key.len() as i32,
+                session_key_encryption_key_bytes: ECRYPTFS_MAX_KEY_BYTES as i32,
                 flags: ECRYPTFS_SESSION_KEY_ENCRYPTION_KEY_SET,
                 session_key_encryption_key: [0u8; ECRYPTFS_MAX_KEY_BYTES],
                 signature: [0u8; ECRYPTFS_PASSWORD_SIG_SIZE],
@@ -310,35 +424,56 @@ impl EcryptfsAuthTok {
 }
 
 /// Derive ecryptfs key from passphrase using iterated SHA512 hash.
-/// Returns the derived key and its signature (first 8 bytes hex-encoded).
-fn derive_ecryptfs_key(passphrase: &[u8], key_bytes: usize) -> (Vec<u8>, String) {
-    // Initial hash: passphrase + salt
-    let mut data = Vec::with_capacity(passphrase.len() + ECRYPTFS_DEFAULT_SALT.len());
-    data.extend_from_slice(passphrase);
-    data.extend_from_slice(&ECRYPTFS_DEFAULT_SALT);
+/// Returns the derived key and its signature.
+/// 
+/// The signature is computed as hex(SHA512(derived_key)[0..8]), matching
+/// the ecryptfs-utils implementation in generate_passphrase_sig().
+fn derive_ecryptfs_key(passphrase: &[u8], salt: &[u8; 8]) -> (Vec<u8>, String) {
+    debug!(
+        "derive_ecryptfs_key: salt={} passphrase_len={} iterations={} fekek_len={}",
+        hex::encode(salt),
+        passphrase.len(),
+        ECRYPTFS_DEFAULT_NUM_HASH_ITERATIONS,
+        ECRYPTFS_MAX_KEY_BYTES
+    );
 
-    // Iterate hash
+    // Initial hash: salt + passphrase (salt comes FIRST, per ecryptfs-utils)
+    let mut data = Vec::with_capacity(salt.len() + passphrase.len());
+    data.extend_from_slice(salt);
+    data.extend_from_slice(passphrase);
+
+    // Iterate hash (65536 times total)
     let mut hash = Sha512::digest(&data);
     for _ in 1..ECRYPTFS_DEFAULT_NUM_HASH_ITERATIONS {
         hash = Sha512::digest(&hash);
     }
 
-    // Take first key_bytes as the key
-    let key = hash[..key_bytes].to_vec();
+    // ecryptfs-utils derives a full FEKEK (64 bytes) and computes the
+    // 16-hex-char signature from SHA512(FEKEK)[0..8].
+    let key = hash[..ECRYPTFS_MAX_KEY_BYTES].to_vec();
 
-    // Signature is first 8 bytes hex-encoded
-    let sig = hex::encode(&key[..8]);
+    // Signature is SHA512(derived_key)[0..8] hex-encoded
+    // This matches ecryptfs-utils: after deriving fekek, it does one more
+    // hash and takes first ECRYPTFS_SIG_SIZE (8) bytes for the signature
+    let sig_hash = Sha512::digest(&key);
+    let sig = hex::encode(&sig_hash[..8]);
+
+    debug!(
+        "derive_ecryptfs_key: derived signature={} key_material_len={}",
+        sig,
+        key.len()
+    );
 
     (key, sig)
 }
 
 /// Add ecryptfs key to kernel keyring using add_key syscall.
 /// Returns the signature of the added key.
-fn add_key_to_keyring(passphrase: &[u8], key_bytes: usize) -> anyhow::Result<String> {
-    let (key, sig) = derive_ecryptfs_key(passphrase, key_bytes);
+fn add_key_to_keyring(passphrase: &[u8], key_bytes: usize, salt: &[u8; 8]) -> anyhow::Result<String> {
+    let (key, sig) = derive_ecryptfs_key(passphrase, salt);
 
     // Build the ecryptfs auth_tok structure
-    let auth_tok = EcryptfsAuthTok::new(&key, &sig, &ECRYPTFS_DEFAULT_SALT);
+    let auth_tok = EcryptfsAuthTok::new(&key, &sig, salt);
     let payload = auth_tok.as_bytes();
 
     info!(
