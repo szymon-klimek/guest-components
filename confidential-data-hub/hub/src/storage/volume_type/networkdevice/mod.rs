@@ -459,3 +459,66 @@ impl SecureMount for NetworkDevice {
             .map_err(|e| e.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mount_options_handles_key_values_and_flags() {
+        let parsed = parse_mount_options("vers=4.2,proto=tcp,soft");
+        assert_eq!(parsed.get("vers"), Some(&"4.2".to_string()));
+        assert_eq!(parsed.get("proto"), Some(&"tcp".to_string()));
+        assert_eq!(parsed.get("soft"), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn mount_options_roundtrip_preserves_entries() {
+        let original = "vers=4.2,addr=10.0.0.2,proto=tcp,soft";
+        let parsed = parse_mount_options(original);
+        let serialized = mount_options_to_string(&parsed);
+        let reparsed = parse_mount_options(&serialized);
+
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn ensure_nfs4_mount_options_adds_required_defaults() {
+        let addr: IpAddr = "10.91.117.93".parse().unwrap();
+        let options = ensure_nfs4_mount_options(&addr, None);
+        let parsed = parse_mount_options(&options);
+
+        assert_eq!(parsed.get("vers"), Some(&DEFAULT_NFS_VERSION.to_string()));
+        assert_eq!(parsed.get("addr"), Some(&addr.to_string()));
+    }
+
+    #[test]
+    fn ensure_nfs4_mount_options_respects_user_values() {
+        let addr: IpAddr = "10.91.117.93".parse().unwrap();
+        let options = ensure_nfs4_mount_options(&addr, Some("vers=4.1,addr=1.2.3.4,soft"));
+        let parsed = parse_mount_options(&options);
+
+        assert_eq!(parsed.get("vers"), Some(&"4.1".to_string()));
+        assert_eq!(parsed.get("addr"), Some(&"1.2.3.4".to_string()));
+        assert_eq!(parsed.get("soft"), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn deserialize_networkdevice_parameters_with_ecryptfs() {
+        let json = r#"{
+            "ip_addr": "10.91.117.93",
+            "source_path": "/mnt/nfs/",
+            "encryptionType": "ecryptfs",
+            "passphrase": "kbs://10.91.117.93:31951/default/keys/passphrase",
+            "enable_filename_crypto": "true"
+        }"#;
+
+        let params: NetworkDeviceParameters = serde_json::from_str(json).unwrap();
+        assert_eq!(params.source_path, "/mnt/nfs/");
+
+        match params.encryption_type {
+            Some(NetworkDeviceEncryptType::Ecryptfs(_)) => {}
+            _ => panic!("expected ecryptfs encryption type"),
+        }
+    }
+}

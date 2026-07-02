@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha512, Digest};
 use tracing::{debug, info, error};
 use zeroize::Zeroizing;
-use kms::{Annotations, ProviderSettings};
-use crate::secret;
-use crate::storage::volume_type::blockdevice::error::BlockDeviceError;
+use crate::storage::drivers::get_plaintext_key;
 
 const ECRYPTFS_FS_NAME: &str = "ecryptfs";
 const ECRYPTFS_DEFAULT_SALT: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
@@ -295,37 +293,6 @@ fn parse_string_boolean_to_bool(value: &str) -> bool {
     )
 }
 
-async fn get_plaintext_key(key_uri: &str) -> crate::storage::volume_type::blockdevice::error::Result<Zeroizing<Vec<u8>>> {
-    let key = if key_uri.starts_with("sealed.") {
-        debug!("get key with sealed secret");
-        secret::unseal_secret(key_uri.as_bytes())
-            .await
-            .map_err(|source| BlockDeviceError::GetKeyFailed {
-                source: source.into(),
-            })?
-    } else if key_uri.starts_with("kbs://") {
-        debug!("get key from kbs");
-        kms::new_getter("kbs", ProviderSettings::default())
-            .await
-            .map_err(|source| BlockDeviceError::GetKeyFailed {
-                source: source.into(),
-            })?
-            .get_secret(key_uri, &Annotations::default())
-            .await
-            .map_err(|source| BlockDeviceError::GetKeyFailed {
-                source: source.into(),
-            })?
-    } else if key_uri.starts_with("file://") {
-        debug!("get key from local path");
-        let path = key_uri.trim_start_matches("file://");
-        tokio::fs::read(path).await?
-    } else {
-        return Err(BlockDeviceError::IllegalKeyScheme);
-    };
-
-    Ok(Zeroizing::new(key))
-}
-
 fn normalize_passphrase_bytes(input: &[u8]) -> Zeroizing<Vec<u8>> {
     // Keep secret bytes unchanged except common line endings from file-based secrets.
     let mut output = input.to_vec();
@@ -521,4 +488,74 @@ fn add_key_to_keyring(passphrase: &[u8], key_bytes: usize, salt: &[u8; 8]) -> an
     }
 
     Ok(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_passphrase_trims_trailing_newline_and_crlf_only() {
+        let with_newline = normalize_passphrase_bytes(b"My secure password\n");
+        assert_eq!(with_newline.as_slice(), b"My secure password");
+
+        let with_crlf = normalize_passphrase_bytes(b"My secure password\r\n");
+        assert_eq!(with_crlf.as_slice(), b"My secure password");
+
+        let with_space = normalize_passphrase_bytes(b"My secure password ");
+        assert_eq!(with_space.as_slice(), b"My secure password ");
+    }
+
+    #[test]
+    fn derive_fek_signature_matches_ecryptfs_add_passphrase() {
+        let passphrase = b"My secure password";
+        let (_key, sig) = derive_ecryptfs_key(passphrase, &ECRYPTFS_DEFAULT_SALT);
+
+        // Baseline from: echo "My secure password" | ecryptfs-add-passphrase
+        assert_eq!(sig, "0ab955d75efe229c");
+    }
+
+    #[test]
+    fn derive_fnek_signature_matches_ecryptfs_add_passphrase_fnek() {
+        let passphrase = b"My secure password";
+        let (_key, sig) = derive_ecryptfs_key(passphrase, &ECRYPTFS_DEFAULT_SALT_FNEK);
+
+        // Baseline from: echo "My secure password" | ecryptfs-add-passphrase --fnek
+        assert_eq!(sig, "39b3c3fa4d086d94");
+    }
+
+    #[test]
+    fn derive_uses_full_fekek_not_key_bytes_32() {
+        let passphrase = b"My secure password";
+        let (key, sig) = derive_ecryptfs_key(passphrase, &ECRYPTFS_DEFAULT_SALT);
+
+        assert_eq!(key.len(), ECRYPTFS_MAX_KEY_BYTES);
+        // Old broken behavior (signature from SHA512(first 32 bytes)) produced this value.
+        assert_ne!(sig, "c1d550e095ec50a5");
+        assert_eq!(sig, "0ab955d75efe229c");
+    }
+
+    #[test]
+    fn fnek_default_salt_matches_ecryptfs_add_passphrase_fnek_compatibility() {
+        // ecryptfs-add-passphrase --fnek effectively uses ASCII "99887766"
+        // as 8-byte salt input to generate_passphrase_sig().
+        assert_eq!(ECRYPTFS_DEFAULT_SALT_FNEK, *b"99887766");
+    }
+
+    #[test]
+    fn auth_tok_uses_sha512_and_full_fekek_size() {
+        let key = vec![0x11; ECRYPTFS_MAX_KEY_BYTES];
+        let sig = "0ab955d75efe229c";
+        let auth_tok = EcryptfsAuthTok::new(&key, sig, &ECRYPTFS_DEFAULT_SALT);
+
+        let hash_algo = unsafe { std::ptr::addr_of!(auth_tok.password.hash_algo).read_unaligned() };
+        let key_bytes = unsafe {
+            std::ptr::addr_of!(auth_tok.password.session_key_encryption_key_bytes).read_unaligned()
+        };
+        let salt = unsafe { std::ptr::addr_of!(auth_tok.password.salt).read_unaligned() };
+
+        assert_eq!(hash_algo, PGP_DIGEST_ALGO_SHA512);
+        assert_eq!(key_bytes, ECRYPTFS_MAX_KEY_BYTES as i32);
+        assert_eq!(salt, ECRYPTFS_DEFAULT_SALT);
+    }
 }
