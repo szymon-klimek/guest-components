@@ -12,10 +12,55 @@ use anyhow::{anyhow, bail, Context, Result};
 use tempfile::NamedTempFile;
 use tracing::debug;
 use which::which;
+use zeroize::Zeroizing;
+
+use crate::{
+    secret,
+    storage::volume_type::blockdevice::error::{BlockDeviceError, Result as BlockDeviceResult},
+};
+use kms::{Annotations, ProviderSettings};
 
 pub mod filesystem;
 pub mod luks2;
 pub mod zfs;
+pub mod ecryptfs;
+
+/// Resolve plaintext key bytes from supported URI schemes.
+///
+/// Supported schemes:
+/// - `sealed.`: unseal via the secret module
+/// - `kbs://`: fetch from KBS getter
+/// - `file://`: read from local filesystem
+pub async fn get_plaintext_key(key_uri: &str) -> BlockDeviceResult<Zeroizing<Vec<u8>>> {
+    let key = if key_uri.starts_with("sealed.") {
+        debug!("get key with sealed secret");
+        secret::unseal_secret(key_uri.as_bytes())
+            .await
+            .map_err(|source| BlockDeviceError::GetKeyFailed {
+                source: source.into(),
+            })?
+    } else if key_uri.starts_with("kbs://") {
+        debug!("get key from kbs");
+        kms::new_getter("kbs", ProviderSettings::default())
+            .await
+            .map_err(|source| BlockDeviceError::GetKeyFailed {
+                source: source.into(),
+            })?
+            .get_secret(key_uri, &Annotations::default())
+            .await
+            .map_err(|source| BlockDeviceError::GetKeyFailed {
+                source: source.into(),
+            })?
+    } else if key_uri.starts_with("file://") {
+        debug!("get key from local path");
+        let path = key_uri.trim_start_matches("file://");
+        tokio::fs::read(path).await?
+    } else {
+        return Err(BlockDeviceError::IllegalKeyScheme);
+    };
+
+    Ok(Zeroizing::new(key))
+}
 
 /// Run a command and return the stdout and stderr.
 pub fn run_command(
