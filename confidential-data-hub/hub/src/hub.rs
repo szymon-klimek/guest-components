@@ -30,7 +30,7 @@ pub struct Hub {
     image_client: OnceCell<Mutex<ImageClient>>,
     #[cfg(feature = "ttrpc")]
     aa_client: OnceCell<Option<AttestationAgentServiceClient>>,
-    config: CdhConfig,
+    pub(crate) config: CdhConfig,
 }
 
 impl Hub {
@@ -51,6 +51,21 @@ impl Hub {
         };
 
         hub.init().await?;
+        if let Some(storage) = hub.config.storage.take() {
+            // Spawn mount as a background task - don't block pod startup.
+            // Mount will wait for network and retry in background while pod starts.
+            tokio::spawn(async move {
+                match storage.mount().await {
+                    Ok(mount_point) => {
+                        tracing::info!("Background secure mount succeeded: {mount_point}");
+                    }
+                    Err(e) => {
+                        tracing::error!("Background secure mount failed: {e}");
+                    }
+                }
+            });
+        }
+
         Ok(hub)
     }
 }

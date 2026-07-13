@@ -11,6 +11,7 @@ use config::{Config, File};
 use image_rs::config::ImageConfig;
 use serde::Deserialize;
 use tracing::debug;
+use crate::storage::volume_type::Storage;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "ttrpc")] {
@@ -102,6 +103,9 @@ pub struct CdhConfig {
     /// log configuration
     #[serde(default)]
     pub log: LogConfig,
+
+    /// log configuration
+    pub storage: Option<Storage>
 }
 
 impl CdhConfig {
@@ -113,6 +117,7 @@ impl CdhConfig {
             image: ImageConfig::from_kernel_cmdline(),
             skip_sealed_secret_verification: false,
             log: LogConfig::default(),
+            storage: None
         })
     }
 
@@ -269,6 +274,7 @@ https_proxy = "http://127.0.0.1:8080"
             },
             socket: "unix:///run/confidential-containers/cdh.sock".to_string(),
             skip_sealed_secret_verification: false,
+            storage: None,
         })
     )]
     #[case(
@@ -306,6 +312,7 @@ name = "offline_fs_kbc"
         },
         socket: DEFAULT_CDH_SOCKET_ADDR.to_string(),
         skip_sealed_secret_verification: false,
+        storage: None,
     })
     )]
     #[case(
@@ -338,6 +345,7 @@ some_undefined_field = "unknown value"
         },
         socket: DEFAULT_CDH_SOCKET_ADDR.to_string(),
         skip_sealed_secret_verification: false,
+        storage: None,
     })
     )]
     #[serial]
