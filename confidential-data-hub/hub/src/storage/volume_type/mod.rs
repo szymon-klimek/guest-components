@@ -6,6 +6,7 @@
 #[cfg(feature = "aliyun")]
 pub mod aliyun;
 pub mod blockdevice;
+pub mod networkdevice;
 
 use std::{collections::HashMap, str::FromStr};
 
@@ -24,6 +25,9 @@ pub enum Volume {
 
     #[strum(serialize = "block-device")]
     BlockDevice,
+
+    #[strum(serialize = "network-device")]
+    NetworkDevice,
 }
 
 /// Indicating a mount point and its parameters.
@@ -68,6 +72,12 @@ impl Storage {
             Volume::BlockDevice => {
                 let mut bd = blockdevice::BlockDevice::default();
                 bd.mount(&self.options, &self.flags, &self.mount_point)
+                    .await?;
+                Ok(self.mount_point.clone())
+            }
+            Volume::NetworkDevice => {
+                let mut nd = networkdevice::NetworkDevice::default();
+                nd.mount(&self.options, &self.flags, &self.mount_point)
                     .await?;
                 Ok(self.mount_point.clone())
             }

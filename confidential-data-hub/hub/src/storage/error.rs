@@ -18,6 +18,9 @@ pub enum Error {
     #[error("Error when mounting Block device: {0}")]
     BlockDeviceError(#[from] volume_type::blockdevice::error::BlockDeviceError),
 
+    #[error("Error when mounting Network device: {0}")]
+    NetworkDeviceError(#[from] volume_type::networkdevice::error::NetworkDeviceError),
+
     #[error("Failed to recognize the storage type: {0}")]
     StorageTypeNotRecognized(#[from] strum::ParseError),
 }
