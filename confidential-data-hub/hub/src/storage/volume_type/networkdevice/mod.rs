@@ -22,7 +22,7 @@ use error::{NetworkDeviceError, Result};
 use nix::mount::{mount, MsFlags};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 use strum::Display;
 use tracing::{info, error};
@@ -100,6 +100,40 @@ async fn is_mounted(mount_point: &str) -> Result<bool> {
             .map(|mp| mp == canonical_path.to_string_lossy())
             .unwrap_or(false)
     }))
+}
+
+fn resolve_relative_mount_path(transit_mount_point: &str, relative_mount_path: Option<&str>) -> Result<String> {
+    let Some(relative_mount_path) = relative_mount_path.map(str::trim) else {
+        return Ok(transit_mount_point.to_string());
+    };
+
+    if relative_mount_path.is_empty() {
+        return Ok(transit_mount_point.to_string());
+    }
+
+    let trimmed_relative = relative_mount_path.trim_matches('/');
+    if trimmed_relative.is_empty() {
+        return Ok(transit_mount_point.to_string());
+    }
+
+    let path = Path::new(trimmed_relative);
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(NetworkDeviceError::InvalidRelativeMountPath {
+                    path: relative_mount_path.to_string(),
+                    reason: "path must be relative and must not contain '.' or '..'".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(format!(
+        "{}/{}",
+        transit_mount_point.trim_end_matches('/'),
+        trimmed_relative
+    ))
 }
 
 /// Wait for the system network to be ready.
@@ -296,6 +330,7 @@ pub struct NetworkDeviceParameters {
     source_path: String,
     mount_options: Option<String>,
     transit_mount_point: Option<String>,
+    relative_mount_path: Option<String>,
     #[serde(flatten)]
     encryption_type: Option<NetworkDeviceEncryptType>,
 }
@@ -391,6 +426,15 @@ impl NetworkDevice {
         // 6. do the workflow according to different encryption types
         match parameters.encryption_type {
             Some(NetworkDeviceEncryptType::Ecryptfs(ecryptfs_parameters)) => {
+                let ecryptfs_source_path = resolve_relative_mount_path(
+                    &transit_mount_point,
+                    parameters.relative_mount_path.as_deref(),
+                )?;
+
+                if !Path::new(&ecryptfs_source_path).exists() {
+                    tokio::fs::create_dir_all(&ecryptfs_source_path).await?;
+                }
+
                 // ecryptfs mounts to a sibling directory of the NFS transit mount
                 // e.g., /tmp/<uuid>/nfs -> /tmp/<uuid>/nfs_ecryptfs
                 let ecryptfs_mount_point = format!(
@@ -405,7 +449,7 @@ impl NetworkDevice {
                 }
                 
                 ecryptfs_parameters
-                    .do_mount(&transit_mount_point[..], &ecryptfs_mount_point)
+                    .do_mount(&ecryptfs_source_path, &ecryptfs_mount_point)
                     .await
                     .map_err(|source| NetworkDeviceError::EcryptfsError { source })?;
                 
@@ -484,7 +528,7 @@ mod tests {
 
     #[test]
     fn ensure_nfs4_mount_options_adds_required_defaults() {
-        let addr: IpAddr = "10.91.117.93".parse().unwrap();
+        let addr: IpAddr = "127.0.0.1".parse().unwrap();
         let options = ensure_nfs4_mount_options(&addr, None);
         let parsed = parse_mount_options(&options);
 
@@ -494,7 +538,7 @@ mod tests {
 
     #[test]
     fn ensure_nfs4_mount_options_respects_user_values() {
-        let addr: IpAddr = "10.91.117.93".parse().unwrap();
+        let addr: IpAddr = "127.0.0.1".parse().unwrap();
         let options = ensure_nfs4_mount_options(&addr, Some("vers=4.1,addr=1.2.3.4,soft"));
         let parsed = parse_mount_options(&options);
 
@@ -506,19 +550,53 @@ mod tests {
     #[test]
     fn deserialize_networkdevice_parameters_with_ecryptfs() {
         let json = r#"{
-            "ip_addr": "10.91.117.93",
+            "ip_addr": "127.0.0.1",
             "source_path": "/mnt/nfs/",
+            "relative_mount_path": "tenant-a/models",
             "encryptionType": "ecryptfs",
-            "passphrase": "kbs://10.91.117.93:31951/default/keys/passphrase",
+            "passphrase": "kbs://127.0.0.1:31951/default/keys/passphrase",
             "enable_filename_crypto": "true"
         }"#;
 
         let params: NetworkDeviceParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.source_path, "/mnt/nfs/");
+        assert_eq!(params.relative_mount_path, Some("tenant-a/models".to_string()));
 
         match params.encryption_type {
             Some(NetworkDeviceEncryptType::Ecryptfs(_)) => {}
             _ => panic!("expected ecryptfs encryption type"),
+        }
+    }
+
+    #[test]
+    fn resolve_relative_mount_path_joins_with_transit_mount_point() {
+        let resolved = resolve_relative_mount_path("/tmp/abc/nfs", Some("tenant-a/models"))
+            .expect("must resolve");
+        assert_eq!(resolved, "/tmp/abc/nfs/tenant-a/models");
+    }
+
+    #[test]
+    fn resolve_relative_mount_path_without_relative_path_uses_transit_mount_point() {
+        let resolved = resolve_relative_mount_path("/tmp/abc/nfs", None)
+            .expect("must resolve");
+        assert_eq!(resolved, "/tmp/abc/nfs");
+    }
+
+    #[test]
+    fn resolve_relative_mount_path_with_empty_relative_path_uses_transit_mount_point() {
+        let resolved = resolve_relative_mount_path("/tmp/abc/nfs", Some("   "))
+            .expect("must resolve");
+        assert_eq!(resolved, "/tmp/abc/nfs");
+    }
+
+    #[test]
+    fn resolve_relative_mount_path_rejects_parent_components() {
+        let err = resolve_relative_mount_path("/tmp/abc/nfs", Some("../escape"))
+            .expect_err("must reject parent component");
+
+        match err {
+            NetworkDeviceError::InvalidRelativeMountPath { .. } => {}
+            _ => panic!("expected InvalidRelativeMountPath"),
         }
     }
 }

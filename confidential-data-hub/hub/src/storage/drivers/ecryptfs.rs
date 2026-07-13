@@ -10,12 +10,8 @@ use crate::storage::drivers::get_plaintext_key;
 
 const ECRYPTFS_FS_NAME: &str = "ecryptfs";
 const ECRYPTFS_DEFAULT_SALT: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
-// Compatibility note:
-// ecryptfs-add-passphrase --fnek passes ECRYPTFS_DEFAULT_SALT_FNEK_HEX
-// as a char* to generate_passphrase_sig(), which then consumes only the
-// first 8 bytes as raw salt. That makes the effective FNEK salt bytes
-// ASCII "99887766" (0x39,0x39,0x38,0x38,0x37,0x37,0x36,0x36), yielding
-// signatures like 39b3c3fa4d086d94 for "My secure password".
+
+
 const ECRYPTFS_DEFAULT_SALT_FNEK: [u8; 8] = *b"99887766";
 const ECRYPTFS_DEFAULT_NUM_HASH_ITERATIONS: u32 = 65536;
 // Keyring constants - try session keyring first, as that's what ecryptfs searches
@@ -313,10 +309,6 @@ const ECRYPTFS_SESSION_KEY_ENCRYPTION_KEY_SET: u32 = 0x02;
 const PGP_DIGEST_ALGO_SHA512: i32 = 10;
 // session_key struct size: flags(4) + encrypted_key_size(4) + decrypted_key_size(4) + encrypted_key(512) + decrypted_key(64) = 588
 const ECRYPTFS_SESSION_KEY_SIZE: usize = 4 + 4 + 4 + ECRYPTFS_MAX_ENCRYPTED_KEY_BYTES + ECRYPTFS_MAX_KEY_BYTES;
-
-// TODO: Verify if password_bytes (passphrase length) and hash_algo (10=SHA512)
-// should be set in EcryptfsPassword. Currently works with 0s since kernel uses
-// pre-derived session_key_encryption_key directly.
 
 /// eCryptfs password structure - must match kernel layout exactly
 #[repr(C)]

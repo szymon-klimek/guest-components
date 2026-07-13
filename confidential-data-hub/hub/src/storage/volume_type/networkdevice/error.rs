@@ -47,4 +47,10 @@ pub enum NetworkDeviceError {
     HookCreationError {
         message: String,
     },
+
+    #[error("Invalid relative mount path {path}: {reason}")]
+    InvalidRelativeMountPath {
+        path: String,
+        reason: String,
+    },
 }
